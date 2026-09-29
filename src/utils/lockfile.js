@@ -474,6 +474,22 @@ export async function getSkillHistory(slug, lockPath = getGlobalLockPath()) {
  * Returns the restored entry data, or null if no history exists.
  */
 export async function popHistory(slug, lockPath = getGlobalLockPath()) {
+  // Cheap pre-check for the common no-op case, so rolling back a skill that
+  // was never updated does not take the cross-process lock at all. That path
+  // is reached on every rollback attempt, including ones with nothing to undo,
+  // and acquiring a contended lock for a read we already know is pointless
+  // turns a free operation into one that can wait out the timeout.
+  //
+  // This is advisory only. The read is deliberately not locked, so it can go
+  // stale, and another process may add history between here and the mutation
+  // below. The locked mutation re-checks and remains the only thing that
+  // decides, so a wrong answer here costs a wasted lock, never a lost update.
+  const snapshot = await readLock(lockPath)
+
+  if (!snapshot.skills[slug]?.history?.length) {
+    return null
+  }
+
   // The mutation returns the entry that was rolled back to, which is not part
   // of the lock itself, so it is captured out of band. A retry re-applies the
   // pop to a fresh snapshot, so each attempt still rolls back exactly one

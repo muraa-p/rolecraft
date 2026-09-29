@@ -476,6 +476,84 @@ describe('lockfile', () => {
       { timeout: 30_000 },
     )
 
+    it('does not take the lock to pop a skill that has no history', async () => {
+      // Rolling back something that was never updated is a no-op, and it must
+      // not acquire the cross-process lock to discover that. Proved by holding
+      // the lock for the whole call: a version that acquires first blocks for
+      // the whole stale window before giving up, this one returns at once and
+      // leaves the holder's sentinel alone.
+      await lockModule.addSkillToLock(
+        'owner/no-history',
+        entry('owner/no-history'),
+        lockPath,
+      )
+
+      const sentinel = `${lockPath}.update-lock`
+      const release = await lockModule.__testing.acquireLock(lockPath, {
+        timeoutMs: 5_000,
+        staleMs: 10_000,
+      })
+
+      try {
+        const started = Date.now()
+        const popped = await lockModule.popHistory('owner/no-history', lockPath)
+
+        assert.equal(popped, null)
+        assert.ok(
+          Date.now() - started < 1_000,
+          'a no-op pop waited on the lock instead of skipping it',
+        )
+
+        // Untouched: not stolen as stale, not deleted on the way out.
+        assert.equal(existsSync(sentinel), true)
+      } finally {
+        await release()
+      }
+    })
+
+    it('still rolls back when the pre-check sees no history', async () => {
+      // The pre-check reads outside the lock, so it can be stale. It must stay
+      // advisory: a real rollback cannot be skipped because the snapshot it
+      // looked at was out of date.
+      // `entry` derives contentSha from the slug, so two distinct versions
+      // have to be built by hand or the second add is a no-op and no history
+      // is ever recorded.
+      const version = (sha) => ({
+        contentSha: sha,
+        fileHashes: {},
+        source: 'owner/two-versions',
+        sourceType: 'github',
+      })
+
+      await lockModule.addSkillToLock(
+        'owner/two-versions',
+        version('v1'),
+        lockPath,
+      )
+      await lockModule.addSkillToLock(
+        'owner/two-versions',
+        version('v2'),
+        lockPath,
+      )
+
+      // Guard the premise: without two distinct versions there is no history
+      // to pop and the assertions below would pass for the wrong reason.
+      const seeded = JSON.parse(readFileSync(lockPath, 'utf-8'))
+      assert.equal(seeded.skills['owner/two-versions'].history.length, 1)
+
+      const popped = await lockModule.popHistory('owner/two-versions', lockPath)
+      assert.equal(popped.contentSha, 'v1')
+
+      const after = JSON.parse(readFileSync(lockPath, 'utf-8'))
+      assert.equal(after.skills['owner/two-versions'].contentSha, 'v1')
+
+      // Exactly one version consumed, and a second pop finds nothing.
+      assert.equal(
+        await lockModule.popHistory('owner/two-versions', lockPath),
+        null,
+      )
+    })
+
     it('does not rewrite the file when a mutation changes nothing', async () => {
       await lockModule.addSkillToLock(
         'owner/no-history',
