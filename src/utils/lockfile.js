@@ -5,12 +5,14 @@ import {
   rename,
   rm,
   stat,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { createHash } from 'node:crypto'
 import { getAgentByFlag } from '../agents.js'
 import { home } from './paths.js'
+import { UserError } from './errors.js'
 
 const LOCKFILE_VERSION = 3
 
@@ -120,13 +122,12 @@ export async function writeLock(data, lockPath = getGlobalLockPath()) {
 }
 
 /**
- * Read the lock file along with a hash of the exact bytes that were parsed.
+ * Read the lock file for an update, tolerating a missing or unreadable file.
  *
- * The hash is what lets `updateLock` notice that another process rewrote the
- * file between our read and our write. Comparing the parsed object is not
- * enough, because two different byte sequences can parse to the same value.
+ * Mirrors `readLock`, which is deliberately not reused so the two stay
+ * independent: a reader should never be able to block or fail a writer.
  */
-async function readLockWithHash(lockPath) {
+async function readLockForUpdate(lockPath) {
   let raw
 
   try {
@@ -154,12 +155,7 @@ async function readLockWithHash(lockPath) {
     }
   }
 
-  return {
-    lock,
-    hash: createHash('sha256')
-      .update(raw ?? '')
-      .digest('hex'),
-  }
+  return lock
 }
 
 /**
@@ -193,19 +189,36 @@ function enqueue(lockPath, task) {
 }
 
 /**
+ * Monotonic suffix so two lock acquisitions in the same process never share an
+ * ownership token.
+ */
+let lockTokenCounter = 0
+
+/**
  * How long a lock file may sit untouched before it is treated as abandoned.
  *
  * A process killed mid-update cannot release its own lock, so without this a
- * crash would wedge every later install. The holder rewrites the file on a
- * timer, so a live holder is never mistaken for a dead one as long as it stays
- * inside its own timeout.
+ * crash would wedge every later install. The holder refreshes the sentinel on a
+ * timer, so this means "dead" rather than "slow": a live holder that stalls for
+ * longer still keeps its mtime current and is never stolen from.
  */
 const LOCK_STALE_MS = 10_000
 
 /**
- * Bounded wait for a contended lock, in milliseconds.
+ * How often the holder refreshes its sentinel while it works.
+ *
+ * Kept well under LOCK_STALE_MS so a slow but live holder is not mistaken for
+ * a dead one.
  */
-const LOCK_TIMEOUT_MS = 5_000
+const LOCK_HEARTBEAT_MS = 2_000
+
+/**
+ * Bounded wait for a contended lock, in milliseconds.
+ *
+ * Long enough that a genuinely slow update is waited out rather than reported
+ * as a failure.
+ */
+const LOCK_TIMEOUT_MS = 30_000
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -230,11 +243,14 @@ function lockSentinelPath(lockPath) {
  * Returns a release function. Callers must use try/finally, otherwise a thrown
  * mutation leaves the sentinel behind until it goes stale.
  */
-async function acquireLock(lockPath) {
+async function acquireLock(lockPath, options = {}) {
   const sentinel = lockSentinelPath(lockPath)
+  const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS
+  const staleMs = options.staleMs ?? LOCK_STALE_MS
+
   await ensureParentDir(sentinel)
 
-  const deadline = Date.now() + LOCK_TIMEOUT_MS
+  const deadline = Date.now() + timeoutMs
   let backoff = 2
 
   for (;;) {
@@ -249,15 +265,21 @@ async function acquireLock(lockPath) {
       // cannot block installs forever.
       const heldStat = await stat(sentinel).catch(() => null)
 
-      if (heldStat && Date.now() - heldStat.mtimeMs > LOCK_STALE_MS) {
+      if (heldStat && Date.now() - heldStat.mtimeMs > staleMs) {
         await rm(sentinel, { force: true }).catch(() => {})
         continue
       }
 
       if (Date.now() > deadline) {
-        throw new Error(
-          `Timed out after ${LOCK_TIMEOUT_MS}ms waiting for the ${lockPath} update lock. ` +
-            'Another rolecraft process is holding it.',
+        throw new UserError(
+          `Timed out after ${timeoutMs}ms waiting for another rolecraft process ` +
+            `to finish updating ${lockPath}.`,
+          {
+            suggestion:
+              'Wait for the other install to finish and try again. If no other ' +
+              'install is running, delete the stale lock file and retry.',
+            code: 'LOCK_TIMEOUT',
+          },
         )
       }
 
@@ -268,17 +290,59 @@ async function acquireLock(lockPath) {
       continue
     }
 
+    // Record ownership in the sentinel. Without this, a holder that stalls past
+    // the stale threshold can be stolen from, and on release it would remove
+    // the *new* holder's sentinel instead of its own, quietly breaking mutual
+    // exclusion. A pid + boot-unique suffix keeps a recycled pid from matching.
+    const token = `${process.pid}-${lockTokenCounter++}`
+    let recorded = false
+
+    try {
+      await handle.writeFile(token, 'utf-8')
+      recorded = true
+    } catch {
+      // Best effort. With no record written we cannot tell a takeover from an
+      // untouched file, so release falls back to cleaning up unconditionally
+      // rather than stranding a sentinel nobody will remove.
+    }
+
+    // Refresh the mtime while we work, so LOCK_STALE_MS means "dead" and not
+    // "slow". A suspended laptop or a stalled process then keeps its lock
+    // rather than being overtaken.
+    const heartbeat = setInterval(
+      () => {
+        const now = new Date()
+        utimes(sentinel, now, now).catch(() => {})
+      },
+      Math.max(250, Math.min(LOCK_HEARTBEAT_MS, Math.floor(staleMs / 4))),
+    )
+    heartbeat.unref?.()
+
     let released = false
 
     return async () => {
       if (released) return
       released = true
+
+      clearInterval(heartbeat)
+
       try {
         await handle.close()
       } catch {
-        // Already closed; still fall through to removing the sentinel.
+        // Already closed; still fall through to the ownership check.
       }
-      await rm(sentinel, { force: true }).catch(() => {})
+
+      // Only remove the sentinel if it is still ours. If our lock was declared
+      // stale and taken over while we were stalled, the file now belongs to
+      // someone else and deleting it would let a third writer in alongside
+      // them.
+      const current = recorded
+        ? await readFile(sentinel, 'utf-8').catch(() => null)
+        : null
+
+      if (!recorded || current === token) {
+        await rm(sentinel, { force: true }).catch(() => {})
+      }
     }
   }
 }
@@ -306,10 +370,16 @@ async function updateLock(lockPath, mutate) {
     const release = await acquireLock(lockPath)
 
     try {
-      const { lock } = await readLockWithHash(lockPath)
+      const lock = await readLockForUpdate(lockPath)
       const next = mutate(structuredClone(lock))
 
-      await writeLock(next, lockPath)
+      // A mutation that changed nothing should not rewrite the file. Without
+      // this, something like popHistory on a skill with no history re-serialises
+      // an identical document, and a path that used to return instantly now
+      // takes the lock and can hit the timeout.
+      if (JSON.stringify(next) !== JSON.stringify(lock)) {
+        await writeLock(next, lockPath)
+      }
 
       return next
     } finally {
@@ -484,3 +554,12 @@ export function computeFileHashes(fileContents) {
 
   return hashes
 }
+
+/**
+ * Exposed for tests only.
+ *
+ * The timeout is the one failure mode of the update lock a user can actually
+ * reach, so it needs coverage. Threading a timeout through the three public
+ * helpers would put a test concern in the public API, so it lives here instead.
+ */
+export const __testing = { acquireLock, lockSentinelPath }

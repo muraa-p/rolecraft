@@ -1,6 +1,7 @@
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  existsSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -402,6 +403,92 @@ describe('lockfile', () => {
       const final = JSON.parse(readFileSync(lockPath, 'utf-8'))
       assert.ok(final.skills['owner/after-crash'])
       assert.deepEqual(readdirSync(concDir), ['.skill-lock.json'])
+    })
+
+    it('does not remove a sentinel that was taken over while stalled', async () => {
+      // A holds the lock, stalls past the stale threshold, and B declares it
+      // dead and takes over. When A finally wakes and releases, it must not
+      // delete B's sentinel, or a third writer could enter B's critical section.
+      const sentinel = `${lockPath}.update-lock`
+
+      const release = await lockModule.__testing.acquireLock(lockPath, {
+        timeoutMs: 5_000,
+        staleMs: 10,
+      })
+      await writeFile(sentinel, 'someone-elses-token')
+
+      await release()
+
+      // A's token no longer matches, so the sentinel has to survive.
+      assert.equal(readFileSync(sentinel, 'utf-8'), 'someone-elses-token')
+
+      await rm(sentinel, { force: true })
+    })
+
+    it('removes its own sentinel on a normal release', async () => {
+      const sentinel = `${lockPath}.update-lock`
+
+      const release = await lockModule.__testing.acquireLock(lockPath, {
+        timeoutMs: 5_000,
+        staleMs: 10_000,
+      })
+      assert.equal(existsSync(sentinel), true)
+
+      await release()
+
+      assert.equal(existsSync(sentinel), false)
+    })
+
+    it(
+      'times out with a UserError when a live holder keeps the lock',
+      async () => {
+        // The one failure mode of this mechanism a user can actually reach, so
+        // it is exercised through the private export rather than a public
+        // timeout argument.
+        //
+        // The lock is taken for real rather than faked with a stub sentinel
+        // file: a real holder refreshes its own mtime, so it is correctly never
+        // treated as stale, which is what makes the timeout the outcome.
+        const release = await lockModule.__testing.acquireLock(lockPath, {
+          timeoutMs: 5_000,
+          staleMs: 10_000,
+        })
+
+        try {
+          await assert.rejects(
+            () =>
+              lockModule.__testing.acquireLock(lockPath, {
+                timeoutMs: 150,
+                staleMs: 10_000,
+              }),
+            /Timed out after 150ms waiting for another rolecraft process/,
+          )
+        } finally {
+          await release()
+        }
+      },
+      { timeout: 30_000 },
+    )
+
+    it('does not rewrite the file when a mutation changes nothing', async () => {
+      await lockModule.addSkillToLock(
+        'owner/no-history',
+        entry('owner/no-history'),
+        lockPath,
+      )
+
+      const before = readFileSync(lockPath, 'utf-8')
+
+      // Nothing to roll back, so the file must be left byte-identical rather
+      // than re-serialised. That keeps a previously-instant path instant.
+      assert.equal(
+        await lockModule.popHistory('owner/no-history', lockPath),
+        null,
+      )
+      assert.equal(readFileSync(lockPath, 'utf-8'), before)
+
+      // A no-op write must also not strand a lock.
+      assert.equal(existsSync(`${lockPath}.update-lock`), false)
     })
 
     it('releases the lock when a mutation throws', async () => {
