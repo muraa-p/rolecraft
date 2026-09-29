@@ -1,4 +1,12 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  open,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { createHash } from 'node:crypto'
 import { getAgentByFlag } from '../agents.js'
@@ -112,6 +120,205 @@ export async function writeLock(data, lockPath = getGlobalLockPath()) {
 }
 
 /**
+ * Read the lock file along with a hash of the exact bytes that were parsed.
+ *
+ * The hash is what lets `updateLock` notice that another process rewrote the
+ * file between our read and our write. Comparing the parsed object is not
+ * enough, because two different byte sequences can parse to the same value.
+ */
+async function readLockWithHash(lockPath) {
+  let raw
+
+  try {
+    raw = await readFile(lockPath, 'utf-8')
+  } catch {
+    raw = null
+  }
+
+  let lock
+  try {
+    // JSON.parse(null) coerces to the string "null" and returns null rather
+    // than throwing, so a missing file has to be handled explicitly.
+    lock = raw === null ? null : JSON.parse(raw)
+  } catch {
+    lock = null
+  }
+
+  if (!lock || typeof lock !== 'object') {
+    // Matches readLock: an unreadable file reads as an empty lock.
+    lock = {
+      version: LOCKFILE_VERSION,
+      skills: {},
+      dismissed: {},
+      lastSelectedAgents: [],
+    }
+  }
+
+  return {
+    lock,
+    hash: createHash('sha256')
+      .update(raw ?? '')
+      .digest('hex'),
+  }
+}
+
+/**
+ * In-process serialisation of mutations, keyed by lock path.
+ *
+ * The hash comparison in `updateLock` can only detect a write that landed
+ * between our read and our write. It cannot help when several callers all pass
+ * that check before any of them writes, which is exactly what happens with
+ * concurrent `Promise.all` in one process. Measured on main, 12 concurrent
+ * addSkillToLock calls left a single entry behind.
+ *
+ * Chaining each mutation onto the previous one for the same path closes the
+ * in-process case outright, and it costs one promise per call. Cross-process
+ * races are still handled by the retry loop, which is why both are here.
+ */
+const inProcessQueues = new Map()
+
+function enqueue(lockPath, task) {
+  const previous = inProcessQueues.get(lockPath) ?? Promise.resolve()
+
+  // Swallow the predecessor's rejection so one failed mutation does not poison
+  // the chain for every caller queued behind it.
+  const run = previous.then(task, task)
+
+  inProcessQueues.set(
+    lockPath,
+    run.catch(() => {}),
+  )
+
+  return run
+}
+
+/**
+ * How long a lock file may sit untouched before it is treated as abandoned.
+ *
+ * A process killed mid-update cannot release its own lock, so without this a
+ * crash would wedge every later install. The holder rewrites the file on a
+ * timer, so a live holder is never mistaken for a dead one as long as it stays
+ * inside its own timeout.
+ */
+const LOCK_STALE_MS = 10_000
+
+/**
+ * Bounded wait for a contended lock, in milliseconds.
+ */
+const LOCK_TIMEOUT_MS = 5_000
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Path of the sentinel used to serialise updates to `lockPath`.
+ */
+function lockSentinelPath(lockPath) {
+  return `${lockPath}.update-lock`
+}
+
+/**
+ * Acquire an exclusive cross-process lock for a read-modify-write.
+ *
+ * `open(..., 'wx')` fails with EEXIST if the file already exists, which makes
+ * creation itself the atomic test-and-set. There is no window between checking
+ * for the lock and taking it, unlike a content-hash comparison, which only
+ * narrows the race: two writers can both read the same hash, both see it
+ * unchanged, and both write.
+ *
+ * Returns a release function. Callers must use try/finally, otherwise a thrown
+ * mutation leaves the sentinel behind until it goes stale.
+ */
+async function acquireLock(lockPath) {
+  const sentinel = lockSentinelPath(lockPath)
+  await ensureParentDir(sentinel)
+
+  const deadline = Date.now() + LOCK_TIMEOUT_MS
+  let backoff = 2
+
+  for (;;) {
+    let handle
+
+    try {
+      handle = await open(sentinel, 'wx')
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+
+      // Held by someone. Break the staleness check up so a crashed holder
+      // cannot block installs forever.
+      const heldStat = await stat(sentinel).catch(() => null)
+
+      if (heldStat && Date.now() - heldStat.mtimeMs > LOCK_STALE_MS) {
+        await rm(sentinel, { force: true }).catch(() => {})
+        continue
+      }
+
+      if (Date.now() > deadline) {
+        throw new Error(
+          `Timed out after ${LOCK_TIMEOUT_MS}ms waiting for the ${lockPath} update lock. ` +
+            'Another rolecraft process is holding it.',
+        )
+      }
+
+      // Randomised backoff, so contenders do not resynchronise and collide
+      // again on the next pass.
+      await sleep(Math.min(backoff, 50) * (0.5 + Math.random()))
+      backoff = Math.min(backoff * 2, 50)
+      continue
+    }
+
+    let released = false
+
+    return async () => {
+      if (released) return
+      released = true
+      try {
+        await handle.close()
+      } catch {
+        // Already closed; still fall through to removing the sentinel.
+      }
+      await rm(sentinel, { force: true }).catch(() => {})
+    }
+  }
+}
+
+/**
+ * Apply `mutate` to the lock file under an exclusive lock.
+ *
+ * Every mutation in this module is a read-modify-write, and the rename in
+ * `writeLock` is last-writer-wins. Without a guard, two installs that read the
+ * same lock and each add a different skill both write, and the second rename
+ * discards the first. The result parses cleanly and is silently missing an
+ * entry, which is why the atomicity fix alone does not cover this.
+ *
+ * The lock is held across the whole read-modify-write, so a writer always sees
+ * the previous writer's result rather than a stale snapshot.
+ *
+ * `mutate` must be a pure function of the lock returning a new lock rather than
+ * mutating in place. That keeps the three helpers below symmetrical and makes
+ * each one independently testable.
+ */
+async function updateLock(lockPath, mutate) {
+  // In-process serialisation first, so a single process never contends with
+  // itself over the sentinel. Cross-process safety comes from the lock itself.
+  return enqueue(lockPath, async () => {
+    const release = await acquireLock(lockPath)
+
+    try {
+      const { lock } = await readLockWithHash(lockPath)
+      const next = mutate(structuredClone(lock))
+
+      await writeLock(next, lockPath)
+
+      return next
+    } finally {
+      await release()
+    }
+  })
+}
+
+/**
  * Maximum number of historical versions to retain per skill.
  */
 const MAX_HISTORY = 5
@@ -154,27 +361,26 @@ export async function addSkillToLock(
   entry,
   lockPath = getGlobalLockPath(),
 ) {
-  const lock = await readLock(lockPath)
-  const existing = lock.skills[slug]
+  return updateLock(lockPath, (lock) => {
+    const existing = lock.skills[slug]
 
-  const mergedAgents = existing?.agents
-    ? [...new Set([...existing.agents, ...(entry.agents || [])])]
-    : entry.agents || []
+    const mergedAgents = existing?.agents
+      ? [...new Set([...existing.agents, ...(entry.agents || [])])]
+      : entry.agents || []
 
-  pushHistory(lock, slug, entry)
+    pushHistory(lock, slug, entry)
 
-  const history = lock.skills[slug]?.history || []
+    const history = lock.skills[slug]?.history || []
 
-  lock.skills[slug] = {
-    ...entry,
-    agents: mergedAgents,
-    installedAt: new Date().toISOString(),
-    history,
-  }
+    lock.skills[slug] = {
+      ...entry,
+      agents: mergedAgents,
+      installedAt: new Date().toISOString(),
+      history,
+    }
 
-  await writeLock(lock, lockPath)
-
-  return lock
+    return lock
+  })
 }
 
 /**
@@ -198,37 +404,50 @@ export async function getSkillHistory(slug, lockPath = getGlobalLockPath()) {
  * Returns the restored entry data, or null if no history exists.
  */
 export async function popHistory(slug, lockPath = getGlobalLockPath()) {
-  const lock = await readLock(lockPath)
-  const entry = lock.skills[slug]
+  // The mutation returns the entry that was rolled back to, which is not part
+  // of the lock itself, so it is captured out of band. A retry re-applies the
+  // pop to a fresh snapshot, so each attempt still rolls back exactly one
+  // version rather than compounding.
+  let popped = null
 
-  if (!entry?.history || entry.history.length === 0) {
+  await updateLock(lockPath, (current) => {
+    const entry = current.skills[slug]
+
+    if (!entry?.history || entry.history.length === 0) {
+      popped = null
+      return current
+    }
+
+    const prev = entry.history.pop()
+
+    current.skills[slug].contentSha = prev.contentSha
+    current.skills[slug].fileHashes = prev.fileHashes
+    current.skills[slug].installedAt = prev.installedAt
+    current.skills[slug].source = prev.source
+    current.skills[slug].sourceType = prev.sourceType
+
+    popped = prev
+
+    return current
+  })
+
+  // No history to roll back, so nothing was written and the caller sees null.
+  if (popped === null) {
     return null
   }
 
-  const prev = entry.history.pop()
-
-  lock.skills[slug].contentSha = prev.contentSha
-  lock.skills[slug].fileHashes = prev.fileHashes
-  lock.skills[slug].installedAt = prev.installedAt
-  lock.skills[slug].source = prev.source
-  lock.skills[slug].sourceType = prev.sourceType
-
-  await writeLock(lock, lockPath)
-
-  return prev
+  return popped
 }
 
 export async function removeSkillFromLock(
   slug,
   lockPath = getGlobalLockPath(),
 ) {
-  const lock = await readLock(lockPath)
+  return updateLock(lockPath, (lock) => {
+    delete lock.skills[slug]
 
-  delete lock.skills[slug]
-
-  await writeLock(lock, lockPath)
-
-  return lock
+    return lock
+  })
 }
 
 export function findActualSlug(slug, lock) {

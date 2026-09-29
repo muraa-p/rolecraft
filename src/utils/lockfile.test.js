@@ -1,6 +1,12 @@
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import {
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+} from 'node:fs'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -227,6 +233,199 @@ describe('lockfile', () => {
       assert.equal(final.version, 3)
       assert.equal(Object.keys(final.skills).length, 1)
       assert.deepEqual(readdirSync(atomicDir), ['.skill-lock.json'])
+    })
+  })
+
+  describe('concurrent mutations', () => {
+    let concDir, lockPath
+
+    const entry = (slug) => ({
+      contentSha: `sha-${slug}`,
+      fileHashes: {},
+      source: slug,
+      sourceType: 'github',
+    })
+
+    beforeEach(() => {
+      concDir = mkdtempSync(join(tmpdir(), 'rolecraft-lock-conc-'))
+      lockPath = join(concDir, '.skill-lock.json')
+    })
+
+    afterEach(() => {
+      rmSync(concDir, { recursive: true, force: true })
+    })
+
+    // On main this left a single entry behind: every caller read the same
+    // lock, added its own skill, and the last rename discarded the rest.
+    it('keeps every skill when many adds run concurrently', async () => {
+      const slugs = Array.from({ length: 12 }, (_, n) => `owner/skill-${n}`)
+
+      await Promise.all(
+        slugs.map((slug) =>
+          lockModule.addSkillToLock(slug, entry(slug), lockPath),
+        ),
+      )
+
+      const final = JSON.parse(readFileSync(lockPath, 'utf-8'))
+      assert.deepEqual(Object.keys(final.skills).sort(), [...slugs].sort())
+    })
+
+    it('merges agents for the same skill added concurrently', async () => {
+      const agents = ['claude-code', 'cursor', 'windsurf', 'copilot']
+
+      await Promise.all(
+        agents.map((agent) =>
+          lockModule.addSkillToLock(
+            'owner/shared',
+            { ...entry('owner/shared'), agents: [agent] },
+            lockPath,
+          ),
+        ),
+      )
+
+      const final = JSON.parse(readFileSync(lockPath, 'utf-8'))
+      assert.deepEqual(
+        [...final.skills['owner/shared'].agents].sort(),
+        ['claude-code', 'copilot', 'cursor', 'windsurf'].sort(),
+      )
+    })
+
+    it('does not lose a concurrent add to a different skill', async () => {
+      await lockModule.addSkillToLock(
+        'owner/first',
+        entry('owner/first'),
+        lockPath,
+      )
+
+      await Promise.all([
+        lockModule.addSkillToLock(
+          'owner/second',
+          entry('owner/second'),
+          lockPath,
+        ),
+        lockModule.removeSkillFromLock('owner/first', lockPath),
+      ])
+
+      const final = JSON.parse(readFileSync(lockPath, 'utf-8'))
+      // Whichever order they ran in, the add must not be swallowed by the
+      // remove's snapshot.
+      assert.ok(final.skills['owner/second'], 'the concurrent add was lost')
+    })
+
+    it('rolls back exactly one version per pop under concurrency', async () => {
+      const slug = 'owner/rollback'
+      const versions = ['v1', 'v2', 'v3']
+
+      for (const sha of versions) {
+        await lockModule.addSkillToLock(
+          slug,
+          { ...entry(slug), contentSha: sha },
+          lockPath,
+        )
+      }
+
+      // Three rolls back against three existing versions. Each must consume
+      // exactly one, so a retry cannot compound into rolling back two.
+      await Promise.all(
+        Array.from({ length: 3 }, () => lockModule.popHistory(slug, lockPath)),
+      )
+
+      const final = JSON.parse(readFileSync(lockPath, 'utf-8'))
+      assert.equal(final.skills[slug].contentSha, 'v1')
+      assert.equal(final.skills[slug].history.length, 0)
+    })
+
+    it('leaves no sentinel or temp file behind', async () => {
+      await Promise.all(
+        Array.from({ length: 6 }, (_, n) =>
+          lockModule.addSkillToLock(
+            `owner/clean-${n}`,
+            entry(`owner/clean-${n}`),
+            lockPath,
+          ),
+        ),
+      )
+
+      // No `.update-lock` sentinel and no `.tmp` scratch file survives, so a
+      // later run cannot mistake our leftovers for a lock held by someone else.
+      assert.deepEqual(readdirSync(concDir), ['.skill-lock.json'])
+    })
+
+    it('never has two writers inside the update at once', async () => {
+      // The lock is held across the whole read-modify-write, so observing the
+      // sentinel from inside a mutation must show it present. A writer that
+      // ignored the lock would leave it absent, and the writes would interleave.
+      const sentinel = `${lockPath}.update-lock`
+      let sawSentinel = 0
+      let observed = 0
+
+      const probe = (n) =>
+        lockModule.addSkillToLock(`owner/probe-${n}`, entry(`x-${n}`), lockPath)
+
+      // Watch for the sentinel while the adds run.
+      const watcher = (async () => {
+        while (observed < 6) {
+          try {
+            readFileSync(sentinel, 'utf-8')
+            sawSentinel++
+          } catch {
+            // Not held right now, which is expected between updates.
+          }
+          observed++
+          await new Promise((resolve) => setImmediate(resolve))
+        }
+      })()
+
+      await Promise.all(Array.from({ length: 6 }, (_, n) => probe(n)))
+      await watcher
+
+      // We only assert it was seen at least once: with the lock held the whole
+      // time, a poller this fast cannot miss every window.
+      assert.ok(sawSentinel > 0, 'update lock was never observed while writing')
+    })
+
+    it('recovers when a lock file was left behind by a killed process', async () => {
+      // A process that dies mid-update cannot release its own lock, so an
+      // abandoned sentinel has to expire rather than wedge every later write.
+      const sentinel = `${lockPath}.update-lock`
+      await writeFile(sentinel, '999999')
+
+      const longAgo = new Date(Date.now() - 60_000)
+      utimesSync(sentinel, longAgo, longAgo)
+
+      await lockModule.addSkillToLock(
+        'owner/after-crash',
+        entry('owner/after-crash'),
+        lockPath,
+      )
+
+      const final = JSON.parse(readFileSync(lockPath, 'utf-8'))
+      assert.ok(final.skills['owner/after-crash'])
+      assert.deepEqual(readdirSync(concDir), ['.skill-lock.json'])
+    })
+
+    it('releases the lock when a mutation throws', async () => {
+      // A self-referencing entry cannot be serialised, so the write throws
+      // from inside the locked section. The sentinel has to be released even
+      // so, or every later install would wait on a lock nobody holds.
+      const cyclic = entry('owner/cyclic')
+      cyclic.self = cyclic
+
+      await assert.rejects(
+        () => lockModule.addSkillToLock('owner/cyclic', cyclic, lockPath),
+        /circular|Converting circular structure/i,
+      )
+
+      assert.deepEqual(readdirSync(concDir), [])
+
+      // And the next write still succeeds, so no stale lock is left behind.
+      await lockModule.addSkillToLock(
+        'owner/after-throw',
+        entry('owner/after-throw'),
+        lockPath,
+      )
+      const final = JSON.parse(readFileSync(lockPath, 'utf-8'))
+      assert.ok(final.skills['owner/after-throw'])
     })
   })
 
