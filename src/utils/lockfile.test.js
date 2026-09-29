@@ -353,36 +353,42 @@ describe('lockfile', () => {
     })
 
     it('never has two writers inside the update at once', async () => {
-      // The lock is held across the whole read-modify-write, so observing the
-      // sentinel from inside a mutation must show it present. A writer that
-      // ignored the lock would leave it absent, and the writes would interleave.
+      // Mutual exclusion, checked by holding the lock and proving a second
+      // writer cannot get in. Polling for the sentinel and hoping to catch a
+      // held window would be a race: the observer can miss every window and
+      // still pass, or fail on a fast machine purely on timing. Blocking a
+      // known writer and checking it is still blocked has no such window.
       const sentinel = `${lockPath}.update-lock`
-      let sawSentinel = 0
-      let observed = 0
+      const release = await lockModule.__testing.acquireLock(lockPath, {
+        timeoutMs: 50,
+        staleMs: 10_000,
+      })
 
-      const probe = (n) =>
-        lockModule.addSkillToLock(`owner/probe-${n}`, entry(`x-${n}`), lockPath)
+      try {
+        assert.equal(existsSync(sentinel), true, 'lock was not taken')
 
-      // Watch for the sentinel while the adds run.
-      const watcher = (async () => {
-        while (observed < 6) {
-          try {
-            readFileSync(sentinel, 'utf-8')
-            sawSentinel++
-          } catch {
-            // Not held right now, which is expected between updates.
-          }
-          observed++
-          await new Promise((resolve) => setImmediate(resolve))
+        let finished = false
+        const contender = lockModule
+          .addSkillToLock('owner/probe', entry('probe'), lockPath)
+          .then(() => {
+            finished = true
+          })
+
+        // Many event-loop turns and several filesystem round-trips. If the
+        // lock did not exclude, the update would have completed by now.
+        for (let i = 0; i < 5; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          assert.equal(finished, false, 'a second writer entered a held update')
+          assert.equal(existsSync(sentinel), true, 'held lock disappeared')
         }
-      })()
 
-      await Promise.all(Array.from({ length: 6 }, (_, n) => probe(n)))
-      await watcher
+        await release()
+        await contender
 
-      // We only assert it was seen at least once: with the lock held the whole
-      // time, a poller this fast cannot miss every window.
-      assert.ok(sawSentinel > 0, 'update lock was never observed while writing')
+        assert.equal(finished, true, 'contender never completed after release')
+      } finally {
+        await release()
+      }
     })
 
     it('recovers when a lock file was left behind by a killed process', async () => {
