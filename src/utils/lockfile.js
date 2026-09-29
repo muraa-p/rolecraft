@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { createHash } from 'node:crypto'
 import { getAgentByFlag } from '../agents.js'
@@ -54,10 +54,61 @@ export async function readLock(lockPath = getGlobalLockPath()) {
   }
 }
 
+/**
+ * Monotonic suffix so two writes in the same process never share a temp file.
+ */
+let tmpCounter = 0
+
+/**
+ * Rename with a short retry for transient contention.
+ *
+ * POSIX guarantees rename() is atomic, but Windows rejects a replace with
+ * EPERM/EBUSY while the destination is momentarily open — concurrent
+ * `rolecraft` processes locking the same file is enough to trigger it. These
+ * clear on their own, so retry briefly before surfacing the error.
+ */
+async function renameWithRetry(from, to, attempts = 10) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await rename(from, to)
+    } catch (error) {
+      const transient =
+        error.code === 'EPERM' ||
+        error.code === 'EBUSY' ||
+        error.code === 'EACCES'
+
+      if (!transient || attempt === attempts) {
+        throw error
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 5 * attempt))
+    }
+  }
+}
+
+/**
+ * Write the lock file atomically.
+ *
+ * Serialising straight to the final path lets concurrent writers interleave,
+ * so a reader can observe a truncated or half-written file. Writing to a
+ * sibling temp file and renaming it into place keeps the swap atomic on the
+ * same filesystem, so readers only ever see the old or the new file.
+ */
 export async function writeLock(data, lockPath = getGlobalLockPath()) {
   await ensureParentDir(lockPath)
 
-  await writeFile(lockPath, `${JSON.stringify(data, null, 2)}\n`, 'utf-8')
+  // The pid separates processes, the counter separates concurrent writes
+  // within one process.
+  const tmpPath = `${lockPath}.${process.pid}.${tmpCounter++}.tmp`
+
+  try {
+    await writeFile(tmpPath, `${JSON.stringify(data, null, 2)}\n`, 'utf-8')
+    await renameWithRetry(tmpPath, lockPath)
+  } catch (error) {
+    // Never leave a stray temp file behind on a failed write.
+    await rm(tmpPath, { force: true }).catch(() => {})
+    throw error
+  }
 }
 
 /**

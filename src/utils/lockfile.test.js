@@ -1,6 +1,6 @@
-import { describe, it, before, after } from 'node:test'
+import { describe, it, before, after, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -105,6 +105,129 @@ describe('lockfile', () => {
       readFileSync(join(tempDir, '.agents', '.skill-lock.json'), 'utf-8'),
     )
     assert.deepEqual(written, data)
+  })
+
+  describe('writeLock atomicity', () => {
+    let atomicDir, lockPath
+
+    beforeEach(() => {
+      atomicDir = mkdtempSync(join(tmpdir(), 'rolecraft-lock-atomic-'))
+      lockPath = join(atomicDir, '.skill-lock.json')
+    })
+
+    afterEach(() => {
+      rmSync(atomicDir, { recursive: true, force: true })
+    })
+
+    it('leaves no temp files behind on success', async () => {
+      const data = {
+        version: 3,
+        skills: { 'owner/skill': { name: 'Skill' } },
+        dismissed: {},
+        lastSelectedAgents: [],
+      }
+      await lockModule.writeLock(data, lockPath)
+
+      const written = JSON.parse(readFileSync(lockPath, 'utf-8'))
+      assert.deepEqual(written, data)
+      assert.deepEqual(readdirSync(atomicDir), ['.skill-lock.json'])
+    })
+
+    // Windows keeps the destination locked for as long as a reader holds it
+    // open, so a concurrent reader can starve the rename indefinitely. The
+    // torn-read guarantee this covers is a POSIX atomicity property.
+    it('never exposes a partially written file to readers', {
+      skip: process.platform === 'win32' ? 'POSIX-only guarantee' : false,
+    }, async () => {
+      // One entry per write, so each payload is large enough that an
+      // unsynchronised write to the final path would be observable.
+      const build = (n) => ({
+        version: 3,
+        skills: Object.fromEntries(
+          Array.from({ length: 200 }, (_, i) => [
+            `owner/skill-${n}-${i}`,
+            { filler: 'x'.repeat(256) },
+          ]),
+        ),
+        dismissed: {},
+        lastSelectedAgents: [],
+      })
+
+      await lockModule.writeLock(build(0), lockPath)
+
+      let reads = 0
+      let sampling = true
+      // An async reader that yields between reads, so it samples often but
+      // still lets the writers' I/O and retry timers run.
+      const reader = (async () => {
+        while (sampling) {
+          reads++
+          // Must always be complete, parseable JSON — never a truncated prefix.
+          JSON.parse(readFileSync(lockPath, 'utf-8'))
+          await new Promise((resolve) => setImmediate(resolve))
+        }
+      })()
+
+      try {
+        await Promise.all(
+          Array.from({ length: 8 }, (_, n) =>
+            lockModule.writeLock(build(n + 1), lockPath),
+          ),
+        )
+      } finally {
+        sampling = false
+        await reader
+      }
+
+      // The race is only meaningful if the reader actually ran during it.
+      assert.ok(reads > 0, 'reader never sampled during the concurrent writes')
+      JSON.parse(readFileSync(lockPath, 'utf-8'))
+    })
+
+    it('keeps the previous contents when a write fails', async () => {
+      const good = {
+        version: 3,
+        skills: { 'owner/keep': { name: 'Keep' } },
+        dismissed: {},
+        lastSelectedAgents: [],
+      }
+      await lockModule.writeLock(good, lockPath)
+
+      // A value that cannot be serialised throws before anything is renamed,
+      // so the existing lockfile must survive intact.
+      const cyclic = { version: 3, skills: {} }
+      cyclic.skills.self = cyclic
+
+      await assert.rejects(
+        () => lockModule.writeLock(cyclic, lockPath),
+        /circular|Converting circular structure/i,
+      )
+
+      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf-8')), good)
+      assert.deepEqual(readdirSync(atomicDir), ['.skill-lock.json'])
+    })
+
+    it('is safe to call concurrently from the same process', async () => {
+      const writes = Array.from({ length: 24 }, (_, n) =>
+        lockModule.writeLock(
+          {
+            version: 3,
+            skills: { [`owner/skill-${n}`]: { n } },
+            dismissed: {},
+            lastSelectedAgents: [],
+          },
+          lockPath,
+        ),
+      )
+
+      await Promise.all(writes)
+
+      // Last write wins, and it is a complete, valid document.
+      const final = JSON.parse(readFileSync(lockPath, 'utf-8'))
+      assert.equal(final.version, 3)
+      assert.equal(Object.keys(final.skills).length, 1)
+      assert.deepEqual(readdirSync(atomicDir), ['.skill-lock.json'])
+    })
   })
 
   it('addSkillToLock adds entry and sets installedAt', async () => {
