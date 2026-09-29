@@ -8,6 +8,7 @@ import {
   applyProfileData,
   validateProfile,
 } from '../utils/profile.js'
+import { UserError } from '../utils/errors.js'
 
 export async function apiProfileSave(name, options = {}) {
   let agentsData
@@ -134,6 +135,83 @@ const ALLOWED_PROFILE_HOSTS = [
   'raw.gist.github.com',
 ]
 
+/**
+ * Maximum number of redirect hops to follow when importing a profile.
+ */
+const MAX_PROFILE_REDIRECTS = 3
+
+function assertAllowedProfileHost(url) {
+  const { hostname } = new URL(url)
+
+  if (!ALLOWED_PROFILE_HOSTS.includes(hostname)) {
+    throw new UserError(
+      `URL host "${hostname}" is not allowed for profile imports. ` +
+        `Allowed hosts: ${ALLOWED_PROFILE_HOSTS.join(', ')}`,
+      {
+        suggestion: 'Use a direct link to a raw file on an allowed host.',
+        code: 'PROFILE_HOST_NOT_ALLOWED',
+      },
+    )
+  }
+}
+
+const isRedirect = (status) => status >= 300 && status < 400
+
+/**
+ * Fetch a profile body, following redirects by hand.
+ *
+ * `redirect: 'follow'` would let any allowed host bounce the request to an
+ * arbitrary origin, so the allow-list has to be re-checked on every hop rather
+ * than only on the URL the user supplied.
+ */
+async function fetchProfileBody(url) {
+  let current = url
+
+  for (let hop = 0; hop <= MAX_PROFILE_REDIRECTS; hop++) {
+    assertAllowedProfileHost(current)
+
+    const res = await fetch(current, { redirect: 'manual' })
+
+    if (!isRedirect(res.status)) {
+      if (!res.ok) {
+        throw new UserError(`Failed to fetch ${current}: ${res.status}`, {
+          code: 'PROFILE_FETCH_FAILED',
+        })
+      }
+      return res.text()
+    }
+
+    const location = res.headers.get('location')
+    if (!location) {
+      throw new UserError(
+        `Redirect from ${current} did not include a Location header.`,
+        { code: 'PROFILE_REDIRECT_INVALID' },
+      )
+    }
+
+    // Relative redirects are resolved against the URL that produced them.
+    let next
+    try {
+      next = new URL(location, current)
+    } catch {
+      throw new UserError(
+        `Redirect from ${current} pointed at an invalid URL: ${location}`,
+        { code: 'PROFILE_REDIRECT_INVALID' },
+      )
+    }
+
+    current = next.toString()
+  }
+
+  throw new UserError(
+    `Too many redirects while importing profile from ${url} (limit ${MAX_PROFILE_REDIRECTS}).`,
+    {
+      suggestion: 'Use a direct link to the raw profile file.',
+      code: 'PROFILE_REDIRECT_LIMIT',
+    },
+  )
+}
+
 export async function apiProfileImport(path) {
   const { readFile } = await import('node:fs/promises')
   const { resolve } = await import('node:path')
@@ -149,16 +227,7 @@ export async function apiProfileImport(path) {
   let data
   const isUrl = path.startsWith('http://') || path.startsWith('https://')
   if (isUrl) {
-    const parsedUrl = new URL(path)
-    if (!ALLOWED_PROFILE_HOSTS.includes(parsedUrl.hostname)) {
-      throw new Error(
-        `URL host "${parsedUrl.hostname}" is not allowed for profile imports. ` +
-          `Allowed hosts: ${ALLOWED_PROFILE_HOSTS.join(', ')}`,
-      )
-    }
-    const res = await fetch(path)
-    if (!res.ok) throw new Error(`Failed to fetch ${path}: ${res.status}`)
-    data = parseProfileJSON(await res.text())
+    data = parseProfileJSON(await fetchProfileBody(path))
   } else {
     data = parseProfileJSON(await readFile(resolve(path), 'utf-8'))
   }

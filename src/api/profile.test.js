@@ -1,4 +1,4 @@
-import { after, before, beforeEach, describe, it } from 'node:test'
+import { after, afterEach, before, beforeEach, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
@@ -265,6 +265,157 @@ describe('api profile import', () => {
     await assert.rejects(
       () => apiProfileImport('https://example.com/profile.json'),
       /URL host "example\.com" is not allowed for profile imports/,
+    )
+  })
+})
+
+/**
+ * Minimal fetch stub. Routes map a URL to a handler returning a
+ * response-shaped object, and every call is recorded so tests can assert on
+ * which URLs were actually requested.
+ */
+function stubFetch(routes) {
+  const original = globalThis.fetch
+  const calls = []
+
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options })
+    const handler = routes[url]
+    if (!handler) throw new Error(`unexpected fetch to ${url}`)
+    return handler()
+  }
+
+  return {
+    calls,
+    restore() {
+      globalThis.fetch = original
+    },
+  }
+}
+
+function bodyResponse(body) {
+  return {
+    ok: true,
+    status: 200,
+    headers: new Headers(),
+    text: async () => body,
+  }
+}
+
+function redirectResponse(location) {
+  return {
+    ok: false,
+    status: 302,
+    headers: new Headers(location ? { location } : {}),
+    text: async () => '',
+  }
+}
+
+const PROFILE_BODY = JSON.stringify({
+  name: 'redirected',
+  agents: { agents: { mcpServers: { srv: SERVER } } },
+})
+
+describe('api profile import redirects', () => {
+  let stub = null
+
+  afterEach(() => {
+    if (stub) {
+      stub.restore()
+      stub = null
+    }
+  })
+
+  it('follows a redirect between allowed hosts', async () => {
+    stub = stubFetch({
+      'https://github.com/team/p.json': () =>
+        redirectResponse('https://raw.githubusercontent.com/team/main/p.json'),
+      'https://raw.githubusercontent.com/team/main/p.json': () =>
+        bodyResponse(PROFILE_BODY),
+    })
+
+    const result = await apiProfileImport('https://github.com/team/p.json')
+
+    assert.equal(result.name, 'redirected')
+    assert.equal(result.agents, 1)
+    assert.equal(stub.calls.length, 2)
+    assert.equal(stub.calls[0].options.redirect, 'manual')
+  })
+
+  it('rejects a redirect to a host outside the allow list', async () => {
+    stub = stubFetch({
+      'https://github.com/team/p.json': () =>
+        redirectResponse('https://evil.example.com/p.json'),
+    })
+
+    await assert.rejects(
+      () => apiProfileImport('https://github.com/team/p.json'),
+      /URL host "evil\.example\.com" is not allowed for profile imports/,
+    )
+
+    // The disallowed origin must never actually be requested.
+    assert.deepEqual(
+      stub.calls.map((c) => c.url),
+      ['https://github.com/team/p.json'],
+    )
+  })
+
+  it('resolves a relative redirect against the URL that produced it', async () => {
+    stub = stubFetch({
+      'https://raw.githubusercontent.com/team/main/old/p.json': () =>
+        redirectResponse('/team/main/new/p.json'),
+      'https://raw.githubusercontent.com/team/main/new/p.json': () =>
+        bodyResponse(PROFILE_BODY),
+    })
+
+    const result = await apiProfileImport(
+      'https://raw.githubusercontent.com/team/main/old/p.json',
+    )
+
+    assert.equal(result.name, 'redirected')
+    assert.deepEqual(
+      stub.calls.map((c) => c.url),
+      [
+        'https://raw.githubusercontent.com/team/main/old/p.json',
+        'https://raw.githubusercontent.com/team/main/new/p.json',
+      ],
+    )
+  })
+
+  it('stops after too many redirects', async () => {
+    stub = stubFetch({
+      'https://github.com/loop': () =>
+        redirectResponse('https://github.com/loop'),
+    })
+
+    await assert.rejects(
+      () => apiProfileImport('https://github.com/loop'),
+      /Too many redirects while importing profile/,
+    )
+
+    // Original request plus the three allowed hops, and no more.
+    assert.equal(stub.calls.length, 4)
+  })
+
+  it('rejects a redirect with no Location header', async () => {
+    stub = stubFetch({
+      'https://github.com/team/p.json': () => redirectResponse(null),
+    })
+
+    await assert.rejects(
+      () => apiProfileImport('https://github.com/team/p.json'),
+      /did not include a Location header/,
+    )
+  })
+
+  it('rejects a redirect to a malformed URL', async () => {
+    stub = stubFetch({
+      'https://github.com/team/p.json': () => redirectResponse('http://[::1'),
+    })
+
+    await assert.rejects(
+      () => apiProfileImport('https://github.com/team/p.json'),
+      /pointed at an invalid URL/,
     )
   })
 })
