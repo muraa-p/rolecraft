@@ -143,7 +143,7 @@ const ALLOWED_PROFILE_HOSTS = [
 const MAX_PROFILE_REDIRECTS = 3
 
 function assertAllowedProfileHost(url) {
-  const { hostname } = new URL(url)
+  const { hostname, protocol, port, username, password } = new URL(url)
 
   if (!ALLOWED_PROFILE_HOSTS.includes(hostname)) {
     throw new UserError(
@@ -151,6 +151,23 @@ function assertAllowedProfileHost(url) {
         `Allowed hosts: ${ALLOWED_PROFILE_HOSTS.join(', ')}`,
       {
         suggestion: 'Use a direct link to a raw file on an allowed host.',
+        code: 'PROFILE_HOST_NOT_ALLOWED',
+      },
+    )
+  }
+
+  // The allow-list answers "is this the right host?", which a non-default port
+  // or inline credentials can satisfy while the request is not the raw file
+  // endpoint the list is naming. The npm tarball guard already refuses both,
+  // and since the redirect loop re-checks every hop, a `Location` header can
+  // carry them onto an otherwise allowed host. Matching it here keeps the two
+  // allow-lists that share `fetchFollowingRedirects` in agreement.
+  if (protocol !== 'https:' || port || username || password) {
+    throw new UserError(
+      `URL host "${hostname}" is not allowed for profile imports. ` +
+        `Allowed hosts: ${ALLOWED_PROFILE_HOSTS.join(', ')}`,
+      {
+        suggestion: 'Use a direct https link to a raw file on an allowed host.',
         code: 'PROFILE_HOST_NOT_ALLOWED',
       },
     )

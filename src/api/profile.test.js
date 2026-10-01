@@ -373,6 +373,46 @@ describe('api profile import', () => {
       /URL host "example\.com" is not allowed for profile imports/,
     )
   })
+
+  it('rejects an allowed host over plain http', async () => {
+    await assert.rejects(
+      () => apiProfileImport('http://raw.githubusercontent.com/p.json'),
+      /URL host "raw\.githubusercontent\.com" is not allowed for profile imports/,
+    )
+  })
+
+  it('rejects an allowed host on a non-default port', async () => {
+    await assert.rejects(
+      () => apiProfileImport('https://raw.githubusercontent.com:8443/p.json'),
+      /URL host "raw\.githubusercontent\.com" is not allowed for profile imports/,
+    )
+  })
+
+  it('rejects an allowed host carrying inline credentials', async () => {
+    await assert.rejects(
+      () => apiProfileImport('https://user:pass@github.com/p.json'),
+      /URL host "github\.com" is not allowed for profile imports/,
+    )
+  })
+
+  it('still accepts a plain https URL on an allowed host', async () => {
+    // The guard is not meant to break the normal path, so pin the accept case
+    // alongside the rejects. Without this, a guard that refused everything
+    // would pass every test above.
+    const accepted = stubFetch({
+      'https://raw.githubusercontent.com/team/main/p.json': () =>
+        bodyResponse(PROFILE_BODY),
+    })
+
+    try {
+      const result = await apiProfileImport(
+        'https://raw.githubusercontent.com/team/main/p.json',
+      )
+      assert.equal(result.name, 'redirected')
+    } finally {
+      accepted.restore()
+    }
+  })
 })
 
 /**
@@ -522,6 +562,42 @@ describe('api profile import redirects', () => {
     await assert.rejects(
       () => apiProfileImport('https://github.com/team/p.json'),
       /pointed at an invalid URL/,
+    )
+  })
+
+  it('rejects a redirect to an allowed host on a non-default port', async () => {
+    stub = stubFetch({
+      'https://github.com/team/p.json': () =>
+        redirectResponse('https://github.com:8443/team/p.json'),
+    })
+
+    await assert.rejects(
+      () => apiProfileImport('https://github.com/team/p.json'),
+      /URL host "github\.com" is not allowed for profile imports/,
+    )
+
+    // The hostname is on the list, so only the port can be what refused it.
+    // The second hop must never be requested.
+    assert.deepEqual(
+      stub.calls.map((c) => c.url),
+      ['https://github.com/team/p.json'],
+    )
+  })
+
+  it('rejects a redirect to an allowed host with inline credentials', async () => {
+    stub = stubFetch({
+      'https://github.com/team/p.json': () =>
+        redirectResponse('https://user:pass@github.com/team/p.json'),
+    })
+
+    await assert.rejects(
+      () => apiProfileImport('https://github.com/team/p.json'),
+      /URL host "github\.com" is not allowed for profile imports/,
+    )
+
+    assert.deepEqual(
+      stub.calls.map((c) => c.url),
+      ['https://github.com/team/p.json'],
     )
   })
 })
