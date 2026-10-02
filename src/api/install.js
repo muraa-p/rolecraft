@@ -1,6 +1,11 @@
 import { resolveSource, resolveSkills } from '../utils/resolver.js'
 import { installSkill } from '../utils/installer.js'
-import { scanSkill, scanMcpServer, classifyScore } from '../utils/security.js'
+import {
+  scanSkill,
+  scanMcpServer,
+  classifyScore,
+  requiresMcpApproval,
+} from '../utils/security.js'
 import {
   parseMcpServersFromSkill,
   resolveMcpSource,
@@ -192,7 +197,7 @@ export async function apiInstallSkills(source, options = {}) {
           // Security scan for MCP servers
           const mcpSecurity = scanMcpServer(resolvedMcp)
           const mcpLevel = classifyScore(mcpSecurity.score, mcpSecurity.issues)
-          if (mcpLevel === 'danger' && !options.yes) {
+          if (requiresMcpApproval(mcpSecurity) && !options.yes) {
             const issues = mcpSecurity.issues
               .filter((i) => i.severity === 'critical' || i.severity === 'high')
               .map(
@@ -200,13 +205,17 @@ export async function apiInstallSkills(source, options = {}) {
                   `  🔴 [${i.severity}] ${i.description}${i.file ? ` (${i.file})` : ''}`,
               )
               .join('\n')
+            const blocked = mcpLevel === 'danger'
             throw new UserError(
-              `MCP server "${server.name}" blocked by security scan (score: ${mcpSecurity.score}/100).`,
+              blocked
+                ? `MCP server "${server.name}" blocked by security scan (score: ${mcpSecurity.score}/100).`
+                : `MCP server "${server.name}" needs security review (score: ${mcpSecurity.score}/100).`,
               {
-                suggestion:
-                  'Review the flagged issues, or use --yes to force install.',
+                suggestion: blocked
+                  ? 'Review the flagged issues, or use --yes to force install.'
+                  : 'Review the flagged issues, then use --yes to approve the install.',
                 detail: `Flagged issues:\n${issues}`,
-                code: 'MCP_SECURITY_DANGER',
+                code: blocked ? 'MCP_SECURITY_DANGER' : 'MCP_SECURITY_REVIEW',
               },
             )
           }

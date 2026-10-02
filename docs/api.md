@@ -330,14 +330,67 @@ Throws a `UserError` with code `WATCH_SKILL_NOT_FOUND` when `slug` is not instal
 
 ### `convert(source, options?)`
 
-Convert skills between SKILL.md and .mdc formats.
+Convert skills bidirectionally between rolecraft's `SKILL.md` format and Cursor/Claude Code's `.mdc` rule format. Programmatic implementation is in [`src/api/convert.js`](https://github.com/rolecraft-sh/rolecraft/blob/main/src/api/convert.js).
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `dryRun` | `boolean` | `false` | Preview only |
-| `output` | `string` | `process.cwd()` | Output directory |
+| `dryRun` | `boolean` | `false` | Preview conversion plan without writing files or creating directories |
+| `output` | `string` | `process.cwd()` | Target output directory (created recursively if missing in write mode) |
 
-Returns `[{ from: string, to: string, format?: 'skill-to-mdc'\|'mdc-to-skill' }]`.
+#### Return Value
+
+`convert()` always returns an array of result objects (one per converted file), even when passed a single file path:
+
+- **Write mode (`dryRun: false`):** Returns `[{ from: string, to: string, format: 'skill-to-mdc' | 'mdc-to-skill' }]`. Files are written to disk.
+- **Dry-run mode (`dryRun: true`):** Returns `[{ dryRun: true, from: string, to: string }]`. Returns the planned destination paths without creating directories or writing any files to disk (`format` is omitted in dry-run mode).
+
+#### Destination Path Resolution
+
+The destination filename is determined by the input format:
+
+- **SKILL.md → .mdc (`skill-to-mdc`):** Destination filename is derived from the skill's frontmatter slug or name (`${slug}.mdc`, falling back to `skill.mdc`). Slashes in slugs are normalized to dashes.
+- **.mdc → SKILL.md (`mdc-to-skill`):** Destination filename is always `SKILL.md` inside the specified `output` directory (`path.join(outDir, 'SKILL.md')`).
+
+#### Source Resolution and Format Detection
+
+1. **Directories:** `convert()` checks for `SKILL.md` first. If found, only that skill file is converted to `.mdc`. If no `SKILL.md` exists, it scans for all `*.mdc` files in the directory and converts each one to `SKILL.md`. If neither is found, it throws `No SKILL.md or .mdc files found in <dir>`.
+2. **Single Files:** If a file does not use the standard name `SKILL.md` or `.mdc` extension (e.g. `rules.txt`), `convert()` sniffs frontmatter keys: `slug:` detects a skill file, while `alwaysApply:` or `globs:` detects an MDC rule. If neither is found, it throws `Cannot detect format`.
+3. **Empty Files:** Throws `Source is empty: <path>`.
+
+#### Example
+
+```js
+import { convert } from 'rolecraft'
+
+// Preview conversion plan without writing files
+const plan = await convert('./rules/cursor-rule.mdc', {
+  dryRun: true,
+  output: './converted',
+})
+
+console.log(plan)
+// [
+//   {
+//     dryRun: true,
+//     from: '/path/to/rules/cursor-rule.mdc',
+//     to: '/path/to/converted/SKILL.md',
+//   }
+// ]
+
+// Execute the actual conversion
+const results = await convert('./rules/cursor-rule.mdc', {
+  output: './converted',
+})
+
+console.log(results)
+// [
+//   {
+//     from: '/path/to/rules/cursor-rule.mdc',
+//     to: '/path/to/converted/SKILL.md',
+//     format: 'mdc-to-skill',
+//   }
+// ]
+```
 
 ### `init(name?)`
 

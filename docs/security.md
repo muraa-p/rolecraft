@@ -26,6 +26,14 @@ Minimum score is 0. Each unique pattern match across all files counts once per c
 | MEDIUM (×3) | Shell commands, env access, network requests, privilege escalation | `execSync`, `process.env`, `fetch()`, `sudo` |
 | LOW (×1) | Missing metadata, source type | No owner, no description, npm/git source |
 
+### Download-and-execute
+
+A `curl` or `wget` download piped (or chained with `;`) into `sh`, `bash`, `zsh` or `python` is a critical finding in both skill and MCP server scans. Flags before or after the URL do not change that (`curl -fsSL <url> | sh`, `wget -qO- <url> | sh`, `curl --proto '=https' -sSf <url> | sh`), and neither does running the interpreter through `sudo` or an absolute path (`| sudo -E bash`, `| /bin/sh`).
+
+Install one-liners in a skill's files count as well, so a skill whose `SKILL.md` tells the agent to run `curl -fsSL https://example.com/install.sh | bash` is blocked unless you pass `--yes`.
+
+Piping a download into a tool that only reads it is not flagged: `| jq`, `| shasum -a 256`, or Python given a module that only formats it (`| python3 -m json.tool`). Everything else given to Python counts, including `| python3 -`, `| python3 -c "..."`, and any other module — a `-c` program cannot be told apart from one that only parses data, so it is flagged and you are asked. That is deliberate: an earlier version tried to spot an execution by name and let `os.execv`, `os.popen`, `ctypes` and others through while reading as data-only.
+
 ## Example Scenarios
 
 ### 1. Clean skill — `user/code-review`
@@ -192,4 +200,6 @@ This is intended for CI pipelines and fully trusted sources only.
 
 ## MCP Server Scanning
 
-MCP servers referenced in a skill's frontmatter (`mcpServers`) are scanned with the same engine before installation. A server flagged DANGER blocks the whole skill install (`rolecraft install`/`rolecraft ci`), with `--yes` as the only bypass — it always prints a warning. See `MCP_SECURITY_DANGER` in the error output for the flagged issues.
+MCP servers are scanned before direct installation, skill-embedded installation, and restoration from the global MCP lockfile. DANGER findings block installation (`MCP_SECURITY_DANGER`). npm sources currently provide no package contents to scan, so they receive an `unscanned_source` finding and score 89/REVIEW, not SAFE. Direct and skill-embedded installs require explicit approval with `--yes` (API: `yes: true`); otherwise they report `MCP_SECURITY_REVIEW`. `rolecraft ci` has no approval override and reports unscanned npm entries in `mcpFailed` without writing agent configuration. A lockfile entry is not evidence of a completed security scan.
+
+Scanned `gh:` sources retain their existing policy: REVIEW alone does not block installation; DANGER still does. This npm-source fix does not expand the blocking policy for scanned GitHub content.

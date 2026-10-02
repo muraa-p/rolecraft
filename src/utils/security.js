@@ -1,5 +1,40 @@
 const WEIGHTS = { critical: 20, high: 10, medium: 3, low: 1 }
 
+// Download-and-execute: a curl/wget download piped (or `;`-chained) into a
+// shell or Python. Shared by the skill and MCP rules so the two copies cannot
+// drift apart.
+// - Flags may come before or after the URL, alone (`-fsSL`, `-qO-`, `-O -`),
+//   with a value (`-o /tmp/i.sh`, `--retry 3`) or with a quoted value
+//   (`--proto '=https'`). Flags are separated by spaces, tabs or a `\` line
+//   continuation, so a flag-looking word on a later line does not count.
+// - The interpreter may be run by absolute path (`/bin/sh`) or through
+//   `sudo [flags]`, and must be a whole word, so `| shasum` or `; shows ...`
+//   do not match.
+// - Python given its program as an argument (`python3 -c '...'`,
+//   `python3 -m json.tool`) only reads the download as data, the usual way
+//   skills pretty-print an API response, so it does not count, unless that
+//   program can run code (`exec`, `eval`, `subprocess`, `-m code`, ...).
+//   `python3 -` and every shell form still count.
+const SEP = String.raw`(?:[ \t]|\\\r?\n)+`
+const QUOTED = String.raw`'[^'\n]{0,200}'|"[^"\n]{0,200}"`
+const FLAG = String.raw`-(?:[^\s'"|;&]|${QUOTED})*`
+const VALUE = String.raw`(?:${QUOTED}|[^\s'"|;&-][^\s'"|;&]*)`
+const FLAGS = String.raw`(?:${SEP}${FLAG}(?:${SEP}${VALUE})?)*?`
+// - Python reading the download as data is not execution, but only for a
+//   module that provably only formats it. Anything else given to `python3` —
+//   a `-c` program, `-m code`, or any other module — can run what it reads, so
+//   it counts. This is an allow-list on purpose: the previous version tried to
+//   recognise an execution by name (exec, eval, os.system, …), and a name list
+//   is not a closed set — `os.execv`, `os.popen`, `ctypes`, `pexpect` and
+//   others ran the download while reading as data-only.
+const PYTHON_DATA_ONLY = String.raw`[ \t]+(?:-[A-Za-z]+[ \t]+)*-m[ \t]+json\.tool\b`
+const PYTHON = String.raw`python[23]?\b(?!${PYTHON_DATA_ONLY})`
+const DOWNLOAD_AND_EXECUTE = new RegExp(
+  String.raw`(?:curl|wget)${FLAGS}(?:\s|\\\r?\n)+['"]?https?:\/\/[^\s'"]+['"]?${FLAGS}` +
+    String.raw`\s*[|;]\s*(?:sudo(?:[ \t]+-\S*)*[ \t]+)?(?:(?:\/[^\s/]+)*\/)?` +
+    String.raw`(?:(?:bash|sh|zsh)\b|${PYTHON})`,
+)
+
 const MCP_NETWORK_PATTERNS = [
   {
     severity: 'medium',
@@ -41,8 +76,7 @@ const MCP_NETWORK_PATTERNS = [
   {
     severity: 'critical',
     category: 'command_injection',
-    pattern:
-      /(?:curl|wget)\s+['"]?https?:\/\/[^\s'"]+['"]?\s*[|;]\s*(?:bash|sh|zsh|python)/,
+    pattern: DOWNLOAD_AND_EXECUTE,
     description: 'MCP server downloads and executes remote code',
   },
 ]
@@ -83,8 +117,7 @@ const PATTERNS = [
   {
     severity: 'critical',
     category: 'command_injection',
-    pattern:
-      /(?:curl|wget)\s+['"]?https?:\/\/[^\s'"]+['"]?\s*[|;]\s*(?:bash|sh|zsh|python)/,
+    pattern: DOWNLOAD_AND_EXECUTE,
     description: 'Command injection: download-and-execute pattern',
   },
 
@@ -235,6 +268,14 @@ export function classifyScore(score, issues = []) {
   return 'danger'
 }
 
+// Preserve scanned-source policy while requiring approval for unscanned npm.
+export function requiresMcpApproval({ score, issues }) {
+  return (
+    classifyScore(score, issues) === 'danger' ||
+    issues.some((issue) => issue.category === 'unscanned_source')
+  )
+}
+
 export function scanMcpServer(resolved) {
   const issues = []
 
@@ -278,6 +319,17 @@ export function scanMcpServer(resolved) {
   }
 
   if (resolved.sourceType === 'npm') {
+    const hasScannableContents = Object.values(
+      resolved.fileContents || {},
+    ).some((content) => typeof content === 'string')
+    if (!hasScannableContents) {
+      issues.push({
+        severity: 'high',
+        category: 'unscanned_source',
+        description:
+          'npm package contents were not available for security scanning',
+      })
+    }
     issues.push({
       severity: 'low',
       category: 'source_type',

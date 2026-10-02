@@ -1,4 +1,5 @@
 import { watch } from 'node:fs'
+import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { readLock, getProjectLockPath } from '../utils/lockfile.js'
 import { resolveSource } from '../utils/resolver.js'
 import { installSkill } from '../utils/installer.js'
@@ -11,18 +12,40 @@ const agentNameToTarget = Object.fromEntries(
   agents.map((a) => [a.name, a.flag]),
 )
 
+function installTargetsFor(entry) {
+  const targets = (entry.agents || [])
+    .map((agentName) => agentNameToTarget[agentName] || agentName)
+    .filter(Boolean)
+  if (targets.length === 0) targets.push('project')
+  return targets
+}
+
+function outputDirsFor(targets, cwd) {
+  return targets
+    .map((target) => {
+      if (target === 'project') return resolve(cwd, '.agents', 'skills')
+      return agents.find((agent) => agent.flag === target)?.getDir?.()
+    })
+    .filter(Boolean)
+}
+
+function isSameOrChildPath(parentPath, candidatePath) {
+  const relativePath = relative(resolve(parentPath), resolve(candidatePath))
+  return (
+    relativePath === '' ||
+    (relativePath !== '..' &&
+      !relativePath.startsWith(`..${sep}`) &&
+      !isAbsolute(relativePath))
+  )
+}
+
 async function reinstallSkill(slug, skills, cwd) {
   const entry = skills[slug]
   if (entry?.sourceType !== 'local') return false
 
   try {
     const resolved = await resolveSource(entry.source)
-    const targets = (entry.agents || [])
-      .map((a) => agentNameToTarget[a] || a)
-      .filter(Boolean)
-    if (targets.length === 0) targets.push('project')
-
-    await installSkill(resolved, targets, 'copy', cwd)
+    await installSkill(resolved, installTargetsFor(entry), 'copy', cwd)
     return true
   } catch {
     return false
@@ -107,9 +130,21 @@ export async function watchApi(slug, cwd = process.cwd(), options = {}) {
     }
 
     const sourcePath = expandTilde(entry.source)
+    const ignoredOutputDirs = outputDirsFor(
+      installTargetsFor(entry),
+      cwd,
+    ).filter((targetPath) => isSameOrChildPath(sourcePath, targetPath))
 
     const handler = (_eventType, filename) => {
       if (!filename || filename.startsWith('.')) return
+
+      const changedPath = resolve(sourcePath, filename)
+      if (
+        ignoredOutputDirs.some((targetPath) =>
+          isSameOrChildPath(targetPath, changedPath),
+        )
+      )
+        return
 
       const key = `watch-${s}`
       debouncer.schedule(key, async () => {

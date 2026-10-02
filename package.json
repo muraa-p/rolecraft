@@ -1,6 +1,6 @@
 {
   "name": "rolecraft",
-  "version": "2.4.2",
+  "version": "2.5.0",
   "description": "The package manager for AI agents — install, test, publish, and manage skills & MCP servers across 87 agents. Zero-dependency CLI for claude-code, cursor, opencode, omp, and more.",
   "type": "module",
   "bin": {
@@ -102,7 +102,7 @@
   "scripts": {
     "lint": "node --check bin/rolecraft.js src/**/*.js && biome check",
     "lint:fix": "biome check --write",
-    "test": "node --test --test-concurrency=1 $(find src bin -name '*.test.js')",
+    "test": "node --test --test-concurrency=1 $(find src bin .github -name '*.test.js')",
     "test:e2e": "node --test e2e/e2e.test.js",
     "test:coverage": "node --experimental-test-coverage --test --test-coverage-exclude=\"**/*.test.js\" --test-coverage-include=\"src/**\" --test-coverage-include=\"bin/**\"",
     "setup-hooks": "node scripts/setup-hooks.mjs",
